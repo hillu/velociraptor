@@ -4794,7 +4794,10 @@
     description: Selects a random number up to this range.
   category: basic
 - name: range
-  description: Iterate over range.
+  description: |
+    Iterate over range.
+
+    Returns rows containing a field named `_value`.
   type: Plugin
   args:
   - name: start
