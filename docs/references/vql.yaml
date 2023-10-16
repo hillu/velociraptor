@@ -6651,7 +6651,10 @@
     required: true
   category: event
 - name: write_csv
-  description: Write a query into a CSV file.
+  description: |
+    Write a query into a CSV file.
+
+    Also returns the rows written into the file.
   type: Plugin
   args:
   - name: filename
@@ -6669,7 +6672,10 @@
   metadata:
     permissions: FILESYSTEM_WRITE
 - name: write_jsonl
-  description: Write a query into a JSONL file.
+  description: |
+    Write a query into a JSONL file.
+
+    Also returns the rows written into the file.
   type: Plugin
   args:
   - name: filename
