@@ -59,8 +59,8 @@ sources:
                        session_id, artifacts, created, Type, Data, Error
                 FROM delete_flow(client_id=client_id,
                         flow_id=session_id, really_do_it=ReallyDoIt)
-                WHERE log(message=format(format="Deleting flow %v from %v",
-                   args=[session_id, hostname]))
+                WHERE log(message=format(format="Deleting flow %v from %v (%v)",
+                   args=[session_id, client_id, hostname]))
             }, workers=10)
         }, else={
             SELECT * FROM hits
