@@ -18,6 +18,105 @@ import (
 	"www.velocidex.com/golang/velociraptor/uploads"
 )
 
+type linuxProcessReader struct {
+	pid     uint64
+	fd      ReadAtCloser
+	maps    []*mappedRegion
+	pagemap map[int64]uint64
+}
+
+func (self *linuxProcessReader) openMappedFile(mapping *mappedRegion) *os.File {
+	if mapping.Deleted {
+		return nil
+	}
+	file, err := os.Open(fmt.Sprintf("/proc/%d/root%s", self.pid, mapping.FilePath))
+	if err != nil {
+		return nil
+	}
+	fi, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		file.Close()
+		return nil
+	}
+	if st.Dev != mapping.Device || st.Ino != mapping.Inode {
+		file.Close()
+		return nil
+	}
+	return file
+}
+
+func (self *linuxProcessReader) ReadAt(buff []byte, offset int64) (int, error) {
+	var file *os.File
+	var fileBacked = false
+	fileOffset := int64(0)
+
+	for _, mapping := range self.maps {
+		if offset >= mapping.Start && offset <= mapping.Start+mapping.Size &&
+			offset+int64(len(buff)) <= mapping.Start+mapping.Size {
+			if strings.HasPrefix(mapping.FilePath, "/") {
+				fileBacked = true
+			}
+			if mapping.Device == 0 && mapping.Inode == 0 {
+				break
+			}
+			if file = self.openMappedFile(mapping); file != nil {
+				fileOffset = mapping.FileOffset + (offset - mapping.Start)
+				defer file.Close()
+			}
+			break
+		}
+	}
+
+	for i := range buff {
+		buff[i] = 0
+	}
+	count := 0
+	for i := 0; i < len(buff); i += pagesize {
+		const (
+			PM_SOFT_DIRTY     = 1 << 55
+			PM_MMAP_EXCLUSIVE = 1 << 56
+			PM_UFFD_WP        = 1 << 57
+			PM_FILE           = 1 << 61
+			PM_SWAP           = 1 << 62
+			PM_PRESENT        = 1 << 63
+		)
+		e := i + pagesize
+		if e > len(buff) {
+			e = len(buff)
+		}
+		entry := self.pagemap[(offset+int64(i))&int64(pagemask)]
+		if !fileBacked && entry&(PM_SWAP|PM_PRESENT|PM_FILE) == 0 {
+			// page is not present in target process; return zeros
+			count += e - i
+			continue
+		}
+		if fileBacked && file != nil && entry&(PM_FILE) == PM_FILE {
+			// page is present in backing file.
+			n, err := file.ReadAt(buff[i:e], fileOffset+int64(i))
+			if err == nil {
+				count += n
+				continue
+			}
+		}
+		// fall back to reading through /proc/$PID/mem
+		n, err := self.fd.ReadAt(buff[i:e], offset+int64(i))
+		count += n
+		if err != nil {
+			return count, err
+		}
+	}
+	return count, nil
+}
+
+func (self *linuxProcessReader) Close() error {
+	return self.fd.Close()
+}
+
 func (self *ProcessAccessor) OpenWithOSPath(
 	path *accessors.OSPath) (accessors.ReadSeekCloser, error) {
 	if len(path.Components) == 0 {
@@ -36,13 +135,14 @@ func (self *ProcessAccessor) OpenWithOSPath(
 	}
 
 	// Open the process and enumerate its ranges
-	ranges, _, _, err := GetVads(pid)
+	ranges, maps, pagemap, err := GetVads(pid)
 	if err != nil {
 		return nil, err
 	}
+
 	result := &ProcessReader{
 		pid:    pid,
-		handle: fd,
+		handle: &linuxProcessReader{pid, fd, maps, pagemap},
 	}
 
 	for _, r := range ranges {
