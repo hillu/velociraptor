@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,11 +19,84 @@ import (
 	"www.velocidex.com/golang/velociraptor/uploads"
 )
 
+const (
+	PM_SOFT_DIRTY     = 1 << 55
+	PM_MMAP_EXCLUSIVE = 1 << 56
+	PM_UFFD_WP        = 1 << 57
+	PM_FILE           = 1 << 61
+	PM_SWAP           = 1 << 62
+	PM_PRESENT        = 1 << 63
+)
+
+type pagemapRange struct {
+	Start int64
+	End   int64
+	Flags uint64
+}
+
+func (self *pagemapRange) String() string {
+	f := []byte("------")
+	if self.Flags&PM_PRESENT != 0 {
+		f[0] = 'P'
+	}
+	if self.Flags&PM_SWAP != 0 {
+		f[1] = 'S'
+	}
+	if self.Flags&PM_FILE != 0 {
+		f[2] = 'F'
+	}
+	if self.Flags&PM_UFFD_WP != 0 {
+		f[3] = 'U'
+	}
+	if self.Flags&PM_MMAP_EXCLUSIVE != 0 {
+		f[4] = 'X'
+	}
+	if self.Flags&PM_SOFT_DIRTY != 0 {
+		f[5] = 'D'
+	}
+	return fmt.Sprintf("%08x-%08x %s", self.Start, self.End, string(f))
+}
+
+type pagemapRanges struct {
+	ranges []pagemapRange
+}
+
+func (self *pagemapRanges) append(r pagemapRange) {
+	// Assumption: pagemapRanges is always sorted by startAddress and
+	// ranges are only appended, never inserted in the middle. This
+	// holds true as long as /proc/$PID/maps is ordered in this way.
+	if n := len(self.ranges); n > 0 {
+		last := &self.ranges[n-1]
+		if last.End == r.Start && last.Flags == r.Flags {
+			last.End = r.End
+			return
+		}
+	}
+	self.ranges = append(self.ranges, r)
+}
+
+func (self *pagemapRanges) lookup(addr int64) uint64 {
+	i, found := sort.Find(len(self.ranges), func(i int) int {
+		switch {
+		case addr < self.ranges[i].Start:
+			return -1
+		case addr >= self.ranges[i].End:
+			return 1
+		default:
+			return 0
+		}
+	})
+	if found {
+		return self.ranges[i].Flags
+	}
+	return 0
+}
+
 type linuxProcessReader struct {
 	pid     uint64
 	fd      ReadAtCloser
 	maps    []*mappedRegion
-	pagemap map[int64]uint64
+	pagemap pagemapRanges
 }
 
 func (self *linuxProcessReader) openMappedFile(mapping *mappedRegion) *os.File {
@@ -77,19 +151,11 @@ func (self *linuxProcessReader) ReadAt(buff []byte, offset int64) (int, error) {
 	}
 	count := 0
 	for i := 0; i < len(buff); i += pagesize {
-		const (
-			PM_SOFT_DIRTY     = 1 << 55
-			PM_MMAP_EXCLUSIVE = 1 << 56
-			PM_UFFD_WP        = 1 << 57
-			PM_FILE           = 1 << 61
-			PM_SWAP           = 1 << 62
-			PM_PRESENT        = 1 << 63
-		)
 		e := i + pagesize
 		if e > len(buff) {
 			e = len(buff)
 		}
-		entry := self.pagemap[(offset+int64(i))&int64(pagemask)]
+		entry := self.pagemap.lookup((offset + int64(i)) & int64(pagemask))
 		if !fileBacked && entry&(PM_SWAP|PM_PRESENT|PM_FILE) == 0 {
 			// page is not present in target process; return zeros
 			count += e - i
@@ -169,10 +235,10 @@ type mappedRegion struct {
 	Deleted    bool
 }
 
-func GetVads(pid uint64) ([]*uploads.Range, []*mappedRegion, map[int64]uint64, error) {
+func GetVads(pid uint64) ([]*uploads.Range, []*mappedRegion, pagemapRanges, error) {
 	maps_fd, err := os.Open(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, pagemapRanges{}, err
 	}
 
 	defer maps_fd.Close()
@@ -183,7 +249,7 @@ func GetVads(pid uint64) ([]*uploads.Range, []*mappedRegion, map[int64]uint64, e
 
 	var ranges []*uploads.Range
 	var maps []*mappedRegion
-	pagemap := make(map[int64]uint64)
+	var pagemap pagemapRanges
 
 	scanner := bufio.NewScanner(maps_fd)
 	for scanner.Scan() {
@@ -248,21 +314,20 @@ func GetVads(pid uint64) ([]*uploads.Range, []*mappedRegion, map[int64]uint64, e
 
 	err = scanner.Err()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, pagemapRanges{}, err
 	}
 
 	if pagemap_fd != nil {
 		for _, region := range maps {
-			s := region.Start & int64(pagemask)
-			e := (region.Start + region.Size) & int64(pagemask)
-
-			for i := s; i <= e; i += int64(pagesize) {
+			for start := region.Start & int64(pagemask); start <= (region.Start+region.Size)&int64(pagemask); start += int64(pagesize) {
 				var buf [8]byte
-				_, err := pagemap_fd.ReadAt(buf[:], 8*i/int64(pagesize))
+				_, err := pagemap_fd.ReadAt(buf[:], 8*start/int64(pagesize))
 				if err != nil {
 					continue
 				}
-				pagemap[i] = *(*uint64)(unsafe.Pointer(&buf[0]))
+
+				flags := *(*uint64)(unsafe.Pointer(&buf[0]))
+				pagemap.append(pagemapRange{start, start + int64(pagesize), flags})
 			}
 		}
 	}
